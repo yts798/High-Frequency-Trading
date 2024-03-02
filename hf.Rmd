@@ -1,0 +1,437 @@
+---
+title: "Question 3"
+author: "Sun Yutong (Main) Tang Chen (Review)  Ye Chen (Review)"
+date: "2023-10-26"
+output: pdf_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+
+library(conflicted)
+library(tidyverse)
+library(lubridate)
+library(patchwork)
+library(paletteer)
+library(RcppRoll)
+conflict_prefer("lag", "dplyr")
+conflict_prefer("filter", "dplyr")
+
+# This helps ggplot to plot with S3::integer data
+scale_type.integer64 <- function(x) "continuous"
+
+# This is a paletteer function
+cols <- as.vector(paletteer_d("lisa::SalvadorDali", n = 5))
+# cols <- as.vector(paletteer_d("fishualize::Balistes_vetula"))
+# View(palettes_d_names)
+```
+
+(Most codes will not be shown in the report. Please refer to rmd file and Appendix for code block and less important graphs)
+
+
+
+# 1. Explanatory Data Analysis of Original Data
+In this section I am going to explore the characteristics of the data set. And data are mutated and stored to multiple e tibbles. 
+
+First, look at the time interval in this data. Graph(a) in Appendix verify the most time interval is 0.5 seconds, with small amount of intervals of 1 second and rare occurrence of 1.5/2 seconds intervals. Then let's view the plot of last price and plot of bid & ask volume, and delta_turnover (basically proportional to volume).
+```{r, include=FALSE}
+df_rb2305_am1 <- readRDS(file="df_rb2305_am1.Rds")
+
+#First, the file be loaded and relevant columns will be mutated (type conversion)
+#then added to our first tibble, hfdata. Besides, useful change of variable will be saved in our second tibble, delta_hfdata.
+# selection of original data
+hfdata <- tibble(
+  time = df_rb2305_am1$datetime,
+  last = as.numeric(df_rb2305_am1$LastPrice),
+  bid = as.numeric(df_rb2305_am1$BPrice1),
+  ask = as.numeric(df_rb2305_am1$SPrice1),
+  bidvol = as.numeric(df_rb2305_am1$BVol1),
+  askvol = as.numeric(df_rb2305_am1$SVol1),
+  turnover = as.numeric(df_rb2305_am1$Turnover),   
+  volume = as.numeric(df_rb2305_am1$Volume),
+)
+
+len <- length(hfdata$time)
+
+
+# change of value of data, dropping first row
+delta_hfdata <- tibble(
+  time = hfdata$time[2:len],
+  delta_time = diff(hfdata$time),
+  delta_last = diff(hfdata$last),
+  delta_turnover = diff(hfdata$turnover),
+  delta_volume = diff(hfdata$volume),
+)
+
+#view(hfdata)
+#view(delta_hfdata)
+
+# draw time interval plot
+time_interval_plot <- ggplot(delta_hfdata, aes(x = time)) + 
+      geom_line(aes(y = delta_time, color = "last"), size = 1) +
+      ggtitle("delta_time vs time") + 
+      theme_minimal() 
+
+```
+
+```{r, include=FALSE}
+last_plot <- ggplot(hfdata, aes(x = time)) + 
+      geom_line(aes(y = last, color = "last"), size = 1) +
+      ggtitle("last price vs time") + 
+      theme_minimal() 
+  
+bidask_volume_plot <- ggplot(hfdata, aes(x = time)) + 
+      geom_line(aes(y = bidvol, color = "bidvol"), size = 1) +
+      geom_line(aes(y = askvol, color = "askvol"), size = 1) +
+      ggtitle("bid & ask volume vs time") + 
+      theme_minimal() 
+
+d_turnover_plot <- ggplot(delta_hfdata, aes(x = time)) + 
+      geom_line(aes(y = delta_turnover, color = "delta_turnover"), size = 1) +
+      ggtitle("change of turnover vs time") + 
+      theme_minimal() 
+```
+
+```{r}
+last_plot/bidask_volume_plot/d_turnover_plot
+```
+There are interesting findings by comparing the pattern of these 3 figures. First, the last price is moving down and up rapidly and the end position is lower than the initial position. It suggests that without high frequency trading, the period of price increase is short and it might be hard for investors to make profit in this period. For the bid & ask volume plot, bid volume is more volatile and there are large volumes, when the price is dropping. Similarly, even ask volume is more stable but when the price has increase for a while, the ask volume will increase. It demonstrated a significant correlation between the first two plots and indicates the investors' reaction of price change. For the last graph, change of turnover, overall it is volatile and large amount of turnover occur in smaller time intervals.
+
+Lets focus more on the extreme values of these attributes. Using code (a) in Appendix, we obtain conclusions that the at 09:00:26 it reaches its maximum price, at 4105, and at 09:38:12 it reaches its minimum price, at 4087, which is after the maximum price time, so we have its maximum drawdown directly: 0.438%. The largest increase of turnover and volume, which are 21866459170 and 533140 respectively, occurs at the same time: 10:15:00.
+
+
+# 2. Factor Implementation and associated Explanatory Data Analysis
+
+Then we will implement all factors into a new tibble, factors. We added 2.2 factor, volume imbalance. By reading papers, we add the 2.3 factor, VOI, 2.4 factor, OFI. We also create two more functions to find lagged value, and rolling sum with a customized interval. Then we define the 5 & 10 interval price change as the difference of last price at the start and end of interval, and define 5 & 10 intereval VOI, OFI as VOI_5, VOI_10, OFI_5, OFI_10 by calculating their rolling sum, as advised by paper.
+
+```{r, include=FALSE}
+# constract factors tibble to save all relevant factors
+tradeunit <- 10
+factors <- tibble(
+  time = hfdata$time,
+  quoted_spread = hfdata$ask - hfdata$bid,
+  mid_price = (hfdata$ask + hfdata$bid)/2,
+  micro_price = (hfdata$ask*hfdata$askvol + hfdata$bid*hfdata$bidvol)/(hfdata$askvol + hfdata$bidvol),
+  vmap = (hfdata$turnover)/(hfdata$volume * tradeunit),
+  vol_imb = log(hfdata$bidvol/hfdata$askvol),
+)
+
+```
+
+```{r, include=FALSE}
+# for VOI
+# Determine value based on comparison of each price to its predecessor
+delta_bidvol_voi <- sapply(2:length(hfdata$bidvol), function(i) {
+  if (hfdata$bid[i] > hfdata$bid[i-1]) {
+    return(hfdata$bidvol[i])
+  } else if (hfdata$bid[i] == hfdata$bid[i-1]) {
+    return(hfdata$bidvol[i] - hfdata$bidvol[i-1])
+  } else {
+    return(0)
+  }
+})
+
+delta_askvol_voi <- sapply(2:length(hfdata$askvol), function(i) {
+  if (hfdata$ask[i] > hfdata$ask[i-1]) {
+    return(0)
+  } else if (hfdata$ask[i] == hfdata$ask[i-1]) {
+    return(hfdata$askvol[i] - hfdata$askvol[i-1])
+  } else {
+    return(hfdata$askvol[i])
+  }
+})
+
+# Since the first element does not have a predecessor, we'll start the result from the second element
+factors$delta_bidvol_voi <- c(0, delta_bidvol_voi)
+factors$delta_askvol_voi <- c(0, delta_askvol_voi)
+factors$voi <- factors$delta_bidvol_voi - factors$delta_askvol_voi
+```
+
+
+```{r, include=FALSE}
+# for OFI
+# Determine value based on comparison of each price to its predecessor
+delta_bidvol_ofi <- sapply(2:length(hfdata$bidvol), function(i) {
+  if (hfdata$bid[i] > hfdata$bid[i-1]) {
+    return(hfdata$bidvol[i])
+  } else if (hfdata$bid[i] == hfdata$bid[i-1]) {
+    return(hfdata$bidvol[i] - hfdata$bidvol[i-1])
+  } else {
+    return(-hfdata$bidvol[i])
+  }
+})
+
+delta_askvol_ofi <- sapply(2:length(hfdata$askvol), function(i) {
+  if (hfdata$ask[i] > hfdata$ask[i-1]) {
+    return(-hfdata$askvol[i])
+  } else if (hfdata$ask[i] == hfdata$ask[i-1]) {
+    return(hfdata$askvol[i] - hfdata$askvol[i-1])
+  } else {
+    return(hfdata$askvol[i])
+  }
+})
+
+# Since the first element does not have a predecessor, we'll start the result from the second element
+factors$delta_bidvol_ofi <- c(0, delta_bidvol_ofi)
+factors$delta_askvol_ofi <- c(0, delta_askvol_ofi)
+factors$ofi <- factors$delta_bidvol_ofi - factors$delta_askvol_ofi
+```
+
+
+
+```{r, include=FALSE}
+diff_interval <- function(vector, interval) {
+  # Check if the vector is longer than the interval
+  if (length(vector) > interval) {
+    # Calculate indices to apply the 'diff' function over
+    indices <- seq(interval + 1, length(vector))
+
+    # Calculate the differences
+    differences <- sapply(indices, function(i) vector[i] - vector[i - interval])
+
+    # Add zero(s) at the beginning to make the length of the output same as the input
+    result <- c(rep(0, interval), differences)
+  } else {
+    # If the vector is not long enough, it might make sense to return a vector of zeros
+    # because there are no valid differences to calculate. This keeps the same length as the input.
+    result <- rep(0, length(vector))
+  }
+  return(result)
+}
+
+
+a <- c(1,2,3,4,5,6,7,8,9,10)
+roll_sum(a, 10, align = "right", fill = 0)
+factors$last_5 = diff_interval(hfdata$last, 5)
+factors$last_10 = diff_interval(hfdata$last, 10)
+factors$voi_5 = roll_sum(factors$voi, 5, align = "right", fill = 0)
+factors$voi_10 = roll_sum(factors$voi, 10, align = "right", fill = 0)
+factors$ofi_5 = roll_sum(factors$ofi, 5, align = "right", fill = 0)
+factors$ofi_10 = roll_sum(factors$ofi, 10, align = "right", fill = 0)
+
+```
+
+Then we conduct EDA of VOI and OFI. By comparing the voi and ofi plot, we can see the change of these 2 factors are overall volatile and the pattern has significant similarities, while ofi has larger value. We have also checked the VOI_10 and OFI_10 has similar pattern.
+
+```{r, include=FALSE}
+voi_plot <- ggplot(factors, aes(x = time)) + 
+      geom_line(aes(y = voi, color = "voi"), size = 1) +
+      ggtitle("voi vs time") + 
+      theme_minimal() 
+  
+
+ofi_plot <- ggplot(factors, aes(x = time)) + 
+      geom_line(aes(y = ofi, color = "ofi"), size = 1) +
+      ggtitle("ofi vs time") + 
+      theme_minimal() 
+
+#voi_10_plot <- ggplot(factors, aes(x = time)) + 
+#      geom_line(aes(y = voi_10, color = "voi_10"), size = 1) +
+#      ggtitle("voi_10 vs time") + 
+#      theme_minimal() 
+
+#ofi_10_plot <- ggplot(factors, aes(x = time)) + 
+#      geom_line(aes(y = ofi_10, color = "ofi_10"), size = 1) +
+#      ggtitle("ofi_10 vs time") + 
+#      theme_minimal()
+
+#voi_10_plot/ofi_10_plot
+```
+
+
+```{r, fig.width=5, fig.height=3}
+voi_plot/ofi_plot
+```
+
+Referring to Graph Block (b), we have plotted the autocorrelation function of voi, ofi and their change. We have re-produce the ACF figures for VOI factors.It is obvious that the autocorrelation of voi is consistent with the plots generated in page 6 of hftois paper, and ofi demonstrated simimlar properties, means the factors has positive autocorrelation and change has negative autocorrelation.  
+
+
+
+# 3. Testing Factor usefulness
+Then, we will test various factors, using regression and test statistics. We will run regression, using current price change as dependent variable for voi and ofi, and using last 10 interval change as dependent variable for voi_10 and ofi_10.
+
+```{r, include = FALSE}
+factors$last_1 =  c(0,delta_hfdata$delta_last)
+
+# Perform linear regression
+linear_model_voi <- lm(last_1 ~ voi, data = factors)
+
+# Summary of the model
+summary(linear_model_voi)
+
+# Create a scatter plot with the regression line
+voi_plot <- ggplot(factors, aes(x = voi, y = last_1)) +
+  geom_point() +  # Plot the original data points
+  geom_smooth(method = 'lm', formula = y ~ x, se = FALSE) +  # Add the regression line
+  labs(title = "Regression Analysis of VOI with last 1 price", x = "VOI ", y = "last 1 price")
+
+linear_model_voi_10 <- lm(last_10 ~ voi_10, data = factors)
+
+# Create a scatter plot with the regression line
+voi_10_plot <- ggplot(factors, aes(x = voi_10, y = last_10)) +
+  geom_point() +  # Plot the original data points
+  geom_smooth(method = 'lm', formula = y ~ x, se = FALSE) +  # Add the regression line
+  labs(title = "Regression Analysis of VOI_10 with last 10 price", x = "VOI_10 ", y = "last 10 price")
+
+
+
+```
+
+```{r}
+summary(linear_model_voi)
+voi_plot/voi_10_plot
+```
+
+We demonstrate the summary of model for voi vs last_1 price regression here, we can see the p value is small, rejecting the hypothesis that the factor loading of factor voi is small. Also, the plot of regression for voi and voi_10 are displayed, suggesting strong, positive linear relatipnship. The summary of voi_10 vslast_10 model and same procedure for ofi factor are displayed in appendix, code (b), and the result are consistent with ofi. In summary, we can see both voi and ofi are significant, and the two factors demonstrated great similarities, and we have successfully reproduced the test result in the hftois paper for voi factor.
+
+Also, referring to code (c) we have test other factor, such as micro price - middle price, but regression testing has failed, with a p-value greater than 0.1. It means current the useful factors are the voi and ofi concept factors.
+
+# 4. Back-Testing of Factor and Calculate Return
+Here we will propose a simple, high frequency strategy try to make a profit in this morning. It is just a simply back testing with one factor, OFI_10. Considering we only have OFI and VOI concept factors, and we have not tested for multiple factor regressions, we can only have a 1 factor model, otherwise it will lead to serious multilinearity problems. Also, we cannot conduct research to optimise the buy/sell signal value or which factor is more appropriate, since we only have 1 asset and limited data, so this back-testing is just a simple demo that, with a robust setting, we can use high frequency trading to make a profit even the asset price trend is downwards.
+
+The rules of strategy are: 1. No transaction costs 2. We are only price takers 3. Initial wealth $100,0000 4. Once the sell/buy signal appears, spend all funds on selling, buying. 5. When holding for more than 10 intervals (approximate 5 seconds), sell immediately. 6. Buy signal is triggered when previous OFI_10 is greater than its 0.8 quantile, and sell signal is triggered when previous OFI_10 is smaller than its 0.2 quantile. 
+
+```{r}
+#  Back-testing with OFI_10 factor
+sell_val = quantile(factors$ofi_10, 0.2) # value -232
+buy_val = quantile(factors$ofi_10, 0.8) # value 165
+# initial saving
+account <- 1000000
+# initialize buy & sell signal
+buy_signal <- 0
+sell_signal <- 0
+count <- 0
+holding <- 0
+buy_signal <- 0
+sell_signal <- 0
+curren_val <- c()
+for (i in 2:length(hfdata$time)) {
+  count = count + 1
+  # holding for over 5 seconds
+  if (sell_signal == 0 && count > 10) {
+    sell_signal <- 1
+    buy_signal <- 0
+    count <- 0
+  }
+  # seen buy signal
+  if ((factors$ofi_10[i-1] >= buy_val)) {
+    buy_signal <- 1
+    sell_signal <- 0
+  }
+  # seen sell signal
+  if ((factors$ofi_10[i-1] <= sell_val)) {
+    buy_signal <- 0
+    sell_signal <- 1
+  }
+  # in the end, sell everything
+  if (i == length(hfdata$time)) {     
+    #print(hfdata$time[i])
+    sell_signal <- 1
+  }
+  # perform sell
+  if (sell_signal == 1 && holding != 0) {
+    account <- account +  hfdata$last[i] * holding
+    holding <- 0
+    sell_signal <- 0
+    buy_signal <- 0
+  }
+  # perform buy
+  else if (buy_signal == 1 && holding == 0)  {
+    holding <- account %/% hfdata$last[i]
+    account <- account %% hfdata$last[i]
+    buy_signal = 0
+  }
+  curren_val <- c(curren_val, holding*hfdata$last[i] + account)
+}
+# save value for plotting
+plot_account <- tibble(
+  value = curren_val,
+  time = hfdata$time[2:length(hfdata$time)]
+)
+print(account)
+```
+
+```{r, include=FALSE}
+value_plot <- ggplot(plot_account, aes(x = time)) + 
+      geom_line(aes(y = value), size = 1) +
+      ggtitle("value vs time") + 
+      theme_minimal() 
+```
+
+```{r, fig.width=5, fig.height=3}
+value_plot
+```
+
+By checking with the plot of value vs time, we can see the strategy is making profit constantly, finding opportunities with the OFI_10 factors and accumulates wealth step by step. In the end the account value is 1007823, suggesting it makes a 0.78% return in 90 minutes, when the actual price movement is -0.12%, suggesting our strategy and factor is useful. Nevertheless, in real life scenario, we still need to optimise this strategy by improving the signal bound, and consider transaction cost, that is important in high frequency trading.
+
+\newpage
+# Appendix for Question 3
+
+### Graph (a)
+```{r}
+time_interval_plot
+```
+
+### Code (a)
+```{r}
+max(hfdata$last)
+min(hfdata$last)
+hfdata$time[which.max(hfdata$last)]
+hfdata$time[which.min(hfdata$last)]
+index_of_min <- which.min(hfdata$last)
+max_drawdown <- (max(hfdata$last) - min(hfdata$last))/max(hfdata$last)
+
+max(hfdata$turnover)
+max(hfdata$volume)
+
+hfdata$time[which.max(hfdata$turnover)]
+hfdata$time[which.max(hfdata$volume)]
+```
+
+### Graph Block (b)
+```{r, fig.width=5, fig.height=3}
+a1 <- acf(factors$voi, main="Autocorrelation Plot")
+a2 <- acf(diff(factors$voi), main="Autocorrelation Plot")
+a3 <- acf(factors$ofi, main="Autocorrelation Plot")
+a4 <- acf(diff(factors$ofi), main="Autocorrelation Plot")
+```
+
+### Code (b)
+
+```{r, fig.width=5, fig.height=3}
+summary(linear_model_voi_10)
+# Perform linear regression
+linear_model <- lm(last_1 ~ ofi, data = factors)
+# Summary of the model
+summary(linear_model)
+# Create a scatter plot with the regression line
+ggplot(factors, aes(x = ofi, y = last_1)) +
+  geom_point() +  # Plot the original data points
+  geom_smooth(method = 'lm', formula = y ~ x, se = FALSE) +  # Add the regression line
+  labs(title = "Regression Analysis of OFI with last 1 price", x = "OFI ", y = "last 1 price")
+# Perform linear regression
+linear_model <- lm(last_10 ~ ofi_10, data = factors)
+# Summary of the model
+summary(linear_model)
+# Create a scatter plot with the regression line
+ggplot(factors, aes(x = ofi_10, y = last_10)) +
+  geom_point() +  # Plot the original data points
+  geom_smooth(method = 'lm', formula = y ~ x, se = FALSE) +  # Add the regression line
+  labs(title = "Regression Analysis of OFI_10 with last 10 price", x = "OFI_10 ", y = "last 10 price")
+
+```
+
+### Code (c)
+
+```{r, fig.width=5, fig.height=3}
+# Perform linear regression
+linear_model <- lm(last_1 ~ (micro_price-mid_price), data = factors)
+# Summary of the model
+summary(linear_model)
+# Create a scatter plot with the regression line
+ggplot(factors, aes(x = (micro_price-mid_price), y = last_1)) +
+  geom_point() +  # Plot the original data points
+  geom_smooth(method = 'lm', formula = y ~ x, se = FALSE) +  # Add the regression line
+  labs(title = "Regression Analysis of micro_price-mid_price with last 1 price", x = "micro_price-mid_price", y = "last 1 price")
+
+```
+
